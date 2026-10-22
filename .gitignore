@@ -1,0 +1,13 @@
+.env
+dart.env
+.venv/
+__pycache__/
+logs/
+reports/
+site/
+state/
+.alert_state.json
+.dart_cache/doc_*
+.dart_cache/corpcode_*
+.dart_cache/peers/
+*.pyc

@@ -1,0 +1,94 @@
+name: daily-report
+
+on:
+  schedule:
+    - cron: "0 22 * * *"      # 매일 07:00 KST (= 전날 22:00 UTC)
+  workflow_dispatch:          # Actions 탭에서 수동 실행 버튼
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PYTHONIOENCODING: utf-8
+      TZ: Asia/Seoul
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # 원문·업종 캐시와 지난 실행 상태를 실행 간에 유지 (없으면 처음부터 받음)
+      - name: restore cache/state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .dart_cache
+            state
+          key: dart-cache-${{ github.run_id }}
+          restore-keys: dart-cache-
+
+      - name: self-test
+        run: for t in test_offline test_parsers test_parsers2 test_weekly_offline test_alerts_offline; do python $t.py > /dev/null || exit 1; done
+
+      - name: daily report
+        run: |
+          mkdir -p state reports/daily
+          [ -f state/last_run ] && cp state/last_run reports/daily/.last_run || true
+          python weekly.py --days 3 --since-last --no-llm --prefix 일일공시 --out reports/daily --stocks-link
+          cp reports/daily/.last_run state/last_run || true
+
+      - name: industry map (first time or stale)
+        run: python -c "import industry,sys; m=industry.load_map(); sys.exit(0 if industry.map_is_fresh(m) else 1)" || python industry.py build
+
+      - name: risk boards
+        run: python riskboard.py --watchlist watchlist.txt --out reports/stocks
+
+      - name: telegram alerts (if configured)
+        if: env.TELEGRAM_BOT_TOKEN != ''
+        run: |
+          [ -f state/alert_state.json ] && cp state/alert_state.json .alert_state.json || true
+          python alerts.py --once --min-importance 3 || true
+          cp .alert_state.json state/alert_state.json || true
+
+      - name: save cache/state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .dart_cache
+            state
+          key: dart-cache-${{ github.run_id }}
+
+      - name: build site
+        run: python site_build.py reports site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
