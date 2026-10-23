@@ -60,6 +60,18 @@ jobs:
       - name: risk boards
         run: python riskboard.py --watchlist watchlist.txt --out reports/stocks
 
+      # 신호 기록은 캐시가 아니라 저장소에 커밋해 영구 보관
+      - name: signal tracker
+        run: |
+          mkdir -p data
+          python tracker.py log reports/stocks data/signals.jsonl
+          python tracker.py eval data/signals.jsonl reports/tracker.md
+          git config user.name "dart-report-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/signals.jsonl
+          git diff --cached --quiet || git commit -q -m "signals: $(date +%F)"
+          git push -q || true
+
       - name: telegram alerts (if configured)
         if: env.TELEGRAM_BOT_TOKEN != ''
         run: |

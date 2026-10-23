@@ -11,3 +11,4 @@ state/
 .dart_cache/corpcode_*
 .dart_cache/peers/
 *.pyc
+!data/

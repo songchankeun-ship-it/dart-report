@@ -7,6 +7,10 @@ src, dst = Path(sys.argv[1]), Path(sys.argv[2])
 if dst.exists():
     shutil.rmtree(dst)
 shutil.copytree(src, dst, ignore=shutil.ignore_patterns("*.md", "*.json", ".last_run"))
+tracker_md = src / "tracker.md"
+if tracker_md.exists():
+    from html_report import md_to_html
+    (dst / "tracker.html").write_text(md_to_html(tracker_md.read_text("utf-8"), "신호 적중 추적", '<a href="index.html">← 목록</a>'), "utf-8")
 
 daily = sorted((dst / "daily").glob("일일공시_*.html"), reverse=True)
 boards = sorted((dst / "stocks").glob("*.html")) if (dst / "stocks").exists() else []
@@ -47,6 +51,9 @@ for p in daily[:30]:
     L.append(f"<a class=item href='daily/{html.escape(p.name)}'>{a[:4]}-{a[4:6]}-{a[6:]} ~ {b[:4]}-{b[4:6]}-{b[6:]}</a>")
 if not daily:
     L.append("<p class=meta>아직 없음</p>")
+if (dst / "tracker.html").exists():
+    L.append("<h2>검증</h2>")
+    L.append("<a class=item href='tracker.html'>신호 적중 추적<div class=sub>신호가 켜진 뒤 N거래일 수익률 — 신호 유형별 사후 점검</div></a>")
 L.append("<h2>종목별 리스크 보드 <span class=meta>(신호 많은 순)</span></h2>")
 boards.sort(key=lambda p: severity(Path(src) / "stocks" / (p.stem + ".md")), reverse=True)
 for p in boards:
