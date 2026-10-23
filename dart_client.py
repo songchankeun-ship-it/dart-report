@@ -89,8 +89,27 @@ class DartClient:
                 time.sleep(3 ** attempt)
         raise DartError(f"{endpoint}: 네트워크 재시도 4회 실패 — {last_err}")
 
+    # 확정된 정기보고서 재무제표는 바뀌지 않으므로 디스크 캐시 (키: 엔드포인트+전체 파라미터). 올해 분은 7일만.
+    _CACHEABLE = ("fnlttSinglAcntAll.json", "fnlttMultiAcnt.json", "hyslrSttus.json", "hyslrChgSttus.json",
+                  "stockTotqySttus.json", "accnutAdtorNmNdAdtOpinion.json", "company.json")
+
     def _get_json(self, endpoint: str, **params) -> dict:
+        cache = None
+        if endpoint in self._CACHEABLE:
+            key = endpoint.split(".")[0] + "_" + "_".join(f"{k}-{params[k]}" for k in sorted(params))
+            cache = self.cache_dir / "api" / (re.sub(r"[^\w\-]", "_", key)[:150] + ".json")
+            if cache.exists():
+                age_days = (time.time() - cache.stat().st_mtime) / 86400
+                stale = str(params.get("bsns_year", "")) == str(date.today().year) and age_days > 7
+                if not stale and (endpoint == "company.json" and age_days < 30 or endpoint != "company.json"):
+                    try:
+                        return json.loads(cache.read_text("utf-8"))
+                    except ValueError:
+                        pass
         data = self._get(endpoint, **params).json()
+        if cache is not None and data.get("status") in ("000", "013"):
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
         status = data.get("status")
         if status not in ("000", "013"):          # 013 = 조회 결과 없음
             raise DartError(f"{endpoint}: [{status}] {data.get('message')}")
