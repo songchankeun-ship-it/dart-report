@@ -43,6 +43,7 @@ from pipeline import load_watchlist
 from html_report import write_html, build_index
 import quarterly
 import industry
+import prices
 
 REPRTS_RECENT_FIRST = [("11014", "3분기"), ("11012", "반기"), ("11013", "1분기"), ("11011", "사업")]
 
@@ -53,6 +54,9 @@ TH = {
     "rights_cum_high": 30.0,      # 기간 내 유상증자 누적 신주 / 현재 주식수 (%)
     "pledge_high": 50.0,          # 최대주주 보유분 중 담보 비율 (%)
     "major_low": 15.0,            # 최대주주+특수관계인 지분 (%)
+    "cb_near_floor": 10.0,        # 현재가가 리픽싱 하한가 대비 +10% 이내면 '하한 근접'
+    "pledge_drop": 30.0,          # 담보계약 공시일 종가 대비 현재가 하락률 (%) — 반대매매 위험권 표시 기준
+    "rights_discount": 20.0,      # 현재가가 유상증자 발행가 대비 −20% 이하 (청약 전) → 실권 가능성
 }
 
 
@@ -118,6 +122,9 @@ class Board:
     errors: list[str] = field(default_factory=list)
     quarters: list[dict] = field(default_factory=list)
     peer: dict = field(default_factory=dict)        # {"snap":..., "cmp":[...], "ind":..}
+    quote: dict = field(default_factory=dict)
+    daily: list[dict] = field(default_factory=list)
+    flows: list[dict] = field(default_factory=list)
 
 
 # ====================================================================== 수집
@@ -227,6 +234,15 @@ class Collector:
                               "fresh": industry.map_is_fresh(m)}
         except Exception as e:  # noqa: BLE001
             b.errors.append(f"업종 비교 실패: {e}")
+
+        # 시세·수급 (네이버, 전일 종가) — 실패해도 공시 보드는 그대로
+        if corp.get("stock_code"):
+            try:
+                b.quote = prices.get_quote(corp["stock_code"])
+                b.daily = prices.get_daily(corp["stock_code"], days=365 * years + 30)
+                b.flows = prices.get_flows(corp["stock_code"])
+            except Exception as e:  # noqa: BLE001
+                b.errors.append(f"시세 수집 실패: {e}")
 
         b.flags = make_flags(b)
         return b
@@ -459,6 +475,79 @@ def latest_pledge(b: Board) -> dict | None:
     return None
 
 
+def pending_split(b: Board) -> dict | None:
+    """최근 주식병합/분할 결정 중 효력일이 기간 내(또는 미래)인 것. 가격 비교 불가 구간 판단용."""
+    for ev in b.events:
+        if ev.category == "주식병합분할" and ev.parsed and ev.parsed.get("비율"):
+            p = ev.parsed
+            eff = (p.get("효력일") or "").replace("-", "")
+            today = f"{date.today():%Y%m%d}"
+            relist = (p.get("신주상장예정일") or "").replace("-", "")
+            if not eff or relist >= today or eff >= today or (today[:6] == eff[:6]):
+                return {**p, "date": ev.disc.rcept_dt, "url": ev.disc.url}
+            return None
+    return None
+
+
+def cross_signals(b: Board) -> list[dict]:
+    """공시 × 주가 교차 신호 (사실 표시). 각 항목: {lvl, title, why}"""
+    out = []
+    px = (b.quote or {}).get("close")
+    if not px or not b.daily:
+        return out
+    sp = pending_split(b)
+    if sp:
+        r = sp["비율"]
+        out.append({"lvl": "🟠", "title": f"주식{sp['구분']} {f'{r:g}:1' if r >= 1 else f'1:{1 / r:g}'} 진행 중",
+                    "why": f"효력일 {sp.get('효력일')}, 신주 상장 {sp.get('신주상장예정일') or '-'}. 그 전 종가·주식수·전환가는 {sp['구분']} 전 기준이라 "
+                           f"현재가와 직접 비교 불가 — 아래 CB·담보 가격 비교 신호는 생략 ([공시]({sp['url']}))"})
+        return out
+    if (b.quote or {}).get("halted"):
+        out.append({"lvl": "🔴", "title": "현재 매매거래정지 상태", "why": f"네이버 기준 {b.quote.get('halt_text')} — 거래정지 공시 참고. 가격 비교 신호는 생략"})
+        return out
+    # 1) CB: 현재가 vs 전환가·리픽싱 하한 (회차별 집계 → 한 줄)
+    near, below, above = [], [], []
+    for r in overhang(b):
+        iss = next((m for m in mezz_rows(b) if str(m["회차"]).strip() == str(r["회차"])), None)
+        floor = (iss or {}).get("최저가")
+        cv = r.get("가격")
+        if not cv:
+            continue
+        if px <= cv and floor and px <= floor * (1 + TH["cb_near_floor"] / 100):
+            near.append(f"{r['회차']}회(하한 {floor:,})")
+        elif px <= cv:
+            below.append(f"{r['회차']}회(전환가 {cv:,})")
+        else:
+            above.append(f"{r['회차']}회(전환가 {cv:,})")
+    if near:
+        out.append({"lvl": "🟠", "title": f"CB {len(near)}개 회차: 현재가가 리픽싱 하한 근접·이하",
+                    "why": f"현재가 {px:,.0f}원. {', '.join(near)} — 전환가 추가 하향 불가 구간. 전환 유인 낮아 조기상환 청구(풋옵션) 가능성 ↑ (사실 표시, 기준 하한가×{1 + TH['cb_near_floor'] / 100:.1f})"})
+    if below:
+        out.append({"lvl": "🟡", "title": f"CB {len(below)}개 회차: 현재가 < 전환가",
+                    "why": f"현재가 {px:,.0f}원. {', '.join(below)} — 전환 유인 낮음, 리픽싱 조건 있으면 다음 조정일 하향 가능"})
+    if above:
+        out.append({"lvl": "🟡", "title": f"CB {len(above)}개 회차: 현재가 > 전환가 (전환 가능 구간)",
+                    "why": f"현재가 {px:,.0f}원. {', '.join(above)} — 전환 청구 시 신주 출회 가능"})
+    # 2) 담보계약 공시일 대비 주가 하락
+    pl = latest_pledge(b)
+    if pl and not pl.get("stale"):
+        base = prices.close_on(b.daily, pl["date"])
+        if base and px < base:
+            drop = (px / base - 1) * 100
+            if drop <= -TH["pledge_drop"]:
+                out.append({"lvl": "🟠", "title": f"최대주주 담보계약 이후 주가 {drop:.0f}%",
+                            "why": f"담보 공시일({_d(pl['date'])}) 종가 {base:,.0f}원 → 현재 {px:,.0f}원. 담보 비율 {pl.get('담보비율')}%. 담보가치 하락 시 추가담보·반대매매 가능성 (사실 표시, 담보유지비율은 공시에 없음)"})
+    # 3) 진행 중 유상증자 발행가 vs 현재가
+    for r in rights_rows(b):
+        if r["종속회사"] or r["납입"].startswith("⚠철회") or r["납입"].startswith("✅"):
+            continue
+        fp = r.get("발행가")
+        if fp and px < fp * (1 - TH["rights_discount"] / 100):
+            out.append({"lvl": "🟡", "title": f"진행 중 유상증자 발행가 {fp:,}원 > 현재가 {px:,.0f}원",
+                        "why": f"현재가가 발행가보다 {(1 - px / fp) * 100:.0f}% 낮음 — 미납입 상태라 실권·정정 가능성 (결의 {r.get('결의일') or _d(r['date'])})"})
+    return out
+
+
 def make_flags(b: Board) -> list[tuple[str, str, str]]:
     F = []
     # 감사의견
@@ -519,6 +608,8 @@ def make_flags(b: Board) -> list[tuple[str, str, str]]:
             tail = f"하위 {max(100 - r['상위%'], 1)}%" if r["순위"] < r["표본"] else "업종 최하위"
             F.append(("🟡", f"{r['지표']} 업종 {tail}" if r["순위"] < r["표본"] else f"{r['지표']} {tail}",
                       f"{r['값']:,}{'%' if r['지표'] != '매출액' else ''} vs 업종 중앙값 {r['중앙값']:,} ({r['순위']}/{r['표본']}위, {b.peer['year']}년 사업보고서)"))
+    for x in cross_signals(b):
+        F.append((x["lvl"], x["title"], x["why"]))
     order = {"🔴": 0, "🟠": 1, "🟡": 2}
     F.sort(key=lambda f: order.get(f[0], 9))
     return F
@@ -532,6 +623,22 @@ def render(b: Board) -> str:
          + (f" · 발행주식 {b.shares:,}주 ({b.shares_basis})" if b.shares else ""), "",
          "> DART 공시·정기보고서를 자동 정리한 **사실 자료**입니다. 매수·매도 의견이 아니며, 아래 '주의 신호'는 정해진 표시 기준(값과 함께 표기)에 따른 것입니다. "
          "모든 항목은 원문 링크로 확인할 수 있습니다.", ""]
+
+    q = b.quote or {}
+    if q.get("close"):
+        chg = f"{q['change_pct']:+.2f}%" if q.get("change_pct") is not None else ""
+        bits = [f"**{q['close']:,.0f}원** {chg} ({(q.get('traded_at') or '')[:10]} 종가)"]
+        if q.get("market_cap"):
+            bits.append(f"시총 {_won(q['market_cap'])}")
+        if q.get("per"):
+            bits.append(f"PER {q['per']}")
+        if q.get("pbr"):
+            bits.append(f"PBR {q['pbr']}")
+        if q.get("high52") and q.get("low52"):
+            bits.append(f"52주 {q['low52']:,}~{q['high52']:,}")
+        if q.get("halted"):
+            bits.append("🔴 **거래정지**")
+        L += [" · ".join(bits), ""]
 
     L += ["## 주의 신호", ""]
     if b.flags:
@@ -671,6 +778,31 @@ def render(b: Board) -> str:
             L.append(f"| {r['계정']} | {_won(_num(r['당기']))} | {_won(_num(r['전기']))} | {_won(_num(r['전전기']))} |")
         L.append("")
 
+    # 시세·수급
+    if b.daily or b.flows:
+        L += ["## 시세·수급 (네이버 금융, 전일 종가 기준)", ""]
+        if b.daily:
+            d = b.daily
+            def _ret(n):
+                if len(d) > n and d[-1 - n]["close"]:
+                    return f"{(d[-1]['close'] / d[-1 - n]['close'] - 1) * 100:+.1f}%"
+                return "-"
+            L.append(f"- 수익률: 1주 {_ret(5)} · 1개월 {_ret(21)} · 3개월 {_ret(63)} · 6개월 {_ret(126)} · 1년 {_ret(250)}")
+            hi = max(r["close"] for r in d[-250:]); lo = min(r["close"] for r in d[-250:] if r["close"])
+            L.append(f"- 최근 1년 범위 {lo:,.0f} ~ {hi:,.0f}원, 현재 {d[-1]['close']:,.0f}원 (고점 대비 {(d[-1]['close'] / hi - 1) * 100:+.0f}%)")
+        if b.flows:
+            sf = prices.summary_flows(b.flows)
+            def _s(k, label):
+                v, st = sf.get(k), sf.get(k + "_streak") or 0
+                if v is None:
+                    return f"{label} -"
+                return f"{label} {v / 10000:+,.0f}만주" + (f" ({abs(st)}일 연속 {'매수' if st > 0 else '매도'})" if abs(st) >= 3 else "")
+            L.append(f"- 최근 {sf['days']}거래일 순매수: " + " · ".join([_s("individual", "개인"), _s("institution", "기관"), _s("foreign", "외국인")]))
+            L += ["", "| 일자 | 종가 | 개인 | 기관 | 외국인 | 외인보유 |", "|---|---:|---:|---:|---:|---:|"]
+            for r in b.flows[-10:]:
+                L.append(f"| {_d(r['date'])} | {_c(r['close'])} | {_c(r['individual'])} | {_c(r['institution'])} | {_c(r['foreign'])} | {r['foreign_rate'] or '-'}% |")
+        L.append("")
+
     # 업종 내 비교
     L += ["## 업종 내 비교", ""]
     pc = b.peer.get("cmp") or []
@@ -691,7 +823,7 @@ def render(b: Board) -> str:
         L.append("_업종 지도 없음 (`python industry.py build` 로 생성) 또는 동종 상장사 재무 데이터 부족._")
         L.append("")
 
-    L += ["---", "데이터: 금융감독원 DART (공시 원문, 주요사항보고서·정기보고서 정형 API). '출처: DART정형' = 금감원 정형 데이터, '파서' = 원문에서 자동 추출."]
+    L += ["---", "데이터: 금융감독원 DART (공시 원문, 주요사항보고서·정기보고서 정형 API), 시세·수급은 네이버 금융(전일 종가). '출처: DART정형' = 금감원 정형 데이터, '파서' = 원문에서 자동 추출."]
     if b.errors:
         L += ["", "수집 경고: " + "; ".join(b.errors[:5])]
     return "\n".join(L)

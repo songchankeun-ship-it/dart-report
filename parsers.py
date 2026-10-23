@@ -671,6 +671,41 @@ def parse_withdrawal(text: str) -> dict:
     return d
 
 
+# ------------------------------------------------------------------ 주식 병합 / 분할
+def parse_share_consolidation(text: str) -> dict:
+    C = _cells(text)
+    g = lambda label, **kw: _find(C, label, **kw)[1]                 # noqa: E731
+    n = lambda label, **kw: _find(C, label, numeric=True, **kw)[1]   # noqa: E731
+    d: dict = {"_parser": "share_consolidation"}
+    head = text[:300]
+    d["구분"] = "병합" if "병합" in head else "분할"
+    i, _ = _find(C, r"1주당\s*가액")
+    if i is not None:
+        vals = [to_int(C[j][1]) for j in range(i + 1, min(i + 4, len(C)))]
+        vals = [v for v in vals if v]
+        if len(vals) >= 2:
+            d["액면_전"], d["액면_후"] = vals[0], vals[1]
+    j, _ = _find(C, r"보통주식\s*\(?주\)?", context=r"발행주식\s*총수", window=3)
+    if j is not None:
+        vals = [to_int(C[k][1]) for k in range(j + 1, min(j + 4, len(C)))]
+        vals = [v for v in vals if v]
+        if len(vals) >= 2:
+            d["주식수_전"], d["주식수_후"] = vals[0], vals[1]
+    if d.get("주식수_전") and d.get("주식수_후"):
+        d["비율"] = round(d["주식수_전"] / d["주식수_후"], 2)      # 병합 5:1 → 5.0, 분할 1:5 → 0.2
+    elif d.get("액면_전") and d.get("액면_후"):
+        d["비율"] = round(d["액면_후"] / d["액면_전"], 2)
+    d["효력일"] = to_date(n(r"신주의?\s*효력\s*발생일|효력\s*발생일"))
+    k, _ = _find(C, r"매매\s*거래\s*정지\s*(예정)?\s*기간")
+    if k is not None:
+        d["정지_시작"] = to_date(_find(C, r"시작일", after=k)[1])
+        d["정지_종료"] = to_date(_find(C, r"종료일", after=k)[1])
+    d["신주상장예정일"] = to_date(n(r"신주권?\s*상장\s*예정일"))
+    d["목적"] = _clean(g(r"(병합|분할)\s*목적"))
+    d["이사회결의일"] = to_date(n(r"이사회\s*결의일"))
+    return d
+
+
 PARSERS: dict[str, Callable[[str], dict]] = {
     "메자닌발행": parse_convertible_bond,
     "메자닌취득": parse_mezzanine_buyback,
@@ -679,6 +714,7 @@ PARSERS: dict[str, Callable[[str], dict]] = {
     "타법인지분": parse_equity_stake,
     "발행결과": parse_issuance_result,
     "전환가액조정": parse_conversion_adjust,
+    "주식병합분할": parse_share_consolidation,
     "철회": parse_withdrawal,
     "계열사출자": parse_affiliate_investment,
     "유상증자": parse_rights_offering,
@@ -859,6 +895,14 @@ def structured_lines(d: dict | None) -> list[str]:
         L += [f"⚠ {d['대상'] or ''} 결정 철회" + (f" (최초 결의 {d['최초결의일']})" if d.get("최초결의일") else ""),
               f"철회 대상 신주 {d['신주']:,}주" if d.get("신주") else "",
               f"사유 {d['사유'][:80]}" if d.get("사유") else ""]
+    elif p == "share_consolidation":
+        r = d.get("비율")
+        ratio = (f"{r:g}:1" if r and r >= 1 else f"1:{1 / r:g}" if r else "")
+        L += [f"주식{d['구분']} {ratio}" + (f" (액면 {d['액면_전']:,}→{d['액면_후']:,}원)" if d.get("액면_후") else ""),
+              f"발행주식 {d['주식수_전']:,} → {d['주식수_후']:,}주" if d.get("주식수_후") else "",
+              f"효력일 {d['효력일']}" + (f" · 거래정지 {d.get('정지_시작')}~{d.get('정지_종료')}" if d.get("정지_시작") else "")
+              + (f" · 신주상장 {d['신주상장예정일']}" if d.get("신주상장예정일") else "") if d.get("효력일") else "",
+              f"목적 {d['목적']}" if d.get("목적") else ""]
     elif p == "audit_report":
         L += [f"감사의견 {d['감사의견']}" + (" ⚠ 비적정 — 상장폐지 사유 가능" if d.get("비적정") else "") if d.get("감사의견") else "감사의견 미확인(원문 확인 필요)",
               "⚠ 계속기업 관련 중요한 불확실성" if d.get("계속기업_불확실성") else "",
@@ -886,6 +930,7 @@ _HEADLINE_KEYS = {
     "issuance_result": ("실제 ", "납입일"),
     "conversion_adjust": ("제", "사유"),
     "withdrawal": ("⚠", "철회 대상"),
+    "share_consolidation": ("주식", "효력일"),
 }
 
 
